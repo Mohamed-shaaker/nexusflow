@@ -1,4 +1,4 @@
-﻿"""
+"""
 NexusFlow - Background Worker
 ==============================
 Consumes tasks from a Redis Stream and processes them.
@@ -8,6 +8,11 @@ The worker uses the Redis Streams "consumer group" model:
   - Unacknowledged messages are automatically re-delivered on restart (at-least-once delivery).
   - XACK removes a message from the Pending Entries List (PEL) once processing succeeds.
 
+PostgreSQL state transitions (via db.py):
+  XREADGROUP delivers message  →  status set to 'processing'
+  Processing succeeds + XACK   →  status set to 'completed'
+  Processing raises exception  →  status set to 'failed' (message stays in PEL)
+
 Environment variables (with defaults):
   REDIS_HOST        Host of the Redis instance        (default: localhost)
   REDIS_PORT        Port of the Redis instance        (default: 6379)
@@ -15,8 +20,14 @@ Environment variables (with defaults):
   CONSUMER_GROUP    Consumer group name               (default: workers)
   CONSUMER_NAME     Unique name for this worker       (default: worker-1)
   BLOCK_MS          XREADGROUP block timeout in ms    (default: 2000)
+  POSTGRES_HOST     PostgreSQL host                   (default: localhost)
+  POSTGRES_PORT     PostgreSQL port                   (default: 5432)
+  POSTGRES_USER     PostgreSQL user                   (default: nexus)
+  POSTGRES_PASSWORD PostgreSQL password               (default: nexuspassword)
+  POSTGRES_DB       PostgreSQL database               (default: nexusflow)
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -25,6 +36,8 @@ import sys
 import time
 
 import redis
+
+import db
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -122,7 +135,7 @@ def ensure_consumer_group(client: redis.Redis) -> None:
 # Task processing
 # ---------------------------------------------------------------------------
 
-def process_task(task_id: str, fields: dict) -> None:
+async def process_task(task_id: str, fields: dict) -> dict:
     """
     Core business logic placeholder.
 
@@ -130,20 +143,23 @@ def process_task(task_id: str, fields: dict) -> None:
     image resizing, sending an email, calling a downstream API, etc.
     The function should raise an exception on failure so the message
     is NOT acknowledged and will be re-delivered.
+
+    Returns a result dict that is persisted in PostgreSQL on success.
     """
     log.info("Processing task_id=%s  name=%s", task_id, fields.get("name", "unknown"))
 
-    # Simulate work
-    time.sleep(0.1)
+    # Simulate work (replace with actual async I/O or CPU-bound work via executor)
+    await asyncio.sleep(0.1)
 
     log.info("Task completed  task_id=%s", task_id)
+    return {"processed": True, "name": fields.get("name")}
 
 
 # ---------------------------------------------------------------------------
-# Main loop
+# Main async loop
 # ---------------------------------------------------------------------------
 
-def run(client: redis.Redis) -> None:
+async def run(client: redis.Redis) -> None:
     """
     Continuously read from the Redis stream and dispatch tasks.
 
@@ -156,40 +172,65 @@ def run(client: redis.Redis) -> None:
         CONSUMER_NAME, STREAM_NAME, CONSUMER_GROUP,
     )
 
-    while not _shutdown:
-        try:
-            # XREADGROUP with ">" delivers new, undelivered messages.
-            # BLOCK_MS causes the call to block (park the thread) until a
-            # message arrives or the timeout expires — avoids busy-waiting.
-            response = client.xreadgroup(
-                groupname=CONSUMER_GROUP,
-                consumername=CONSUMER_NAME,
-                streams={STREAM_NAME: ">"},
-                count=1,
-                block=BLOCK_MS,
-            )
+    # Initialise the PostgreSQL connection pool before entering the loop.
+    await db.init_pool()
 
-            if not response:
-                # Timeout expired, no messages — loop and check _shutdown flag.
-                continue
+    try:
+        while not _shutdown:
+            try:
+                # XREADGROUP with ">" delivers new, undelivered messages.
+                # BLOCK_MS causes the call to block (park the thread) until a
+                # message arrives or the timeout expires — avoids busy-waiting.
+                response = client.xreadgroup(
+                    groupname=CONSUMER_GROUP,
+                    consumername=CONSUMER_NAME,
+                    streams={STREAM_NAME: ">"},
+                    count=1,
+                    block=BLOCK_MS,
+                )
 
-            # response shape: [(stream_name, [(msg_id, {field: value, ...})])]
-            for _stream, messages in response:
-                for msg_id, fields in messages:
-                    try:
-                        process_task(msg_id, fields)
-                        # ACK removes the message from the Pending Entries List.
-                        client.xack(STREAM_NAME, CONSUMER_GROUP, msg_id)
-                    except Exception as exc:  # noqa: BLE001
-                        # Log the error but do NOT ACK — the message stays in
-                        # the PEL and will be reclaimed after a timeout.
-                        log.error(
-                            "Failed to process task_id=%s: %s", msg_id, exc, exc_info=True
-                        )
+                if not response:
+                    # Timeout expired, no messages — loop and check _shutdown flag.
+                    continue
 
-        except redis.ConnectionError as exc:
-            log.error("Lost Redis connection: %s — retrying in 5s.", exc)
-            time.sleep(5)
+                # response shape: [(stream_name, [(msg_id, {field: value, ...})])]
+                for _stream, messages in response:
+                    for msg_id, fields in messages:
+                        # Extract the application-level task_id from the stream
+                        # message fields (distinct from Redis's own msg_id).
+                        task_id: str = fields.get("task_id", msg_id)
+
+                        # ── 1. Mark as processing ─────────────────────────────
+                        await db.update_task_status(task_id, "processing")
+
+                        try:
+                            result = await process_task(task_id, fields)
+
+                            # ── 2a. Success: ACK + mark completed ────────────
+                            client.xack(STREAM_NAME, CONSUMER_GROUP, msg_id)
+                            await db.update_task_status(
+                                task_id, "completed", result=result
+                            )
+
+                        except Exception as exc:  # noqa: BLE001
+                            # ── 2b. Failure: do NOT ACK, mark failed ─────────
+                            # The message stays in the PEL and will be reclaimed
+                            # after a timeout, enabling at-least-once retries.
+                            log.error(
+                                "Failed to process task_id=%s: %s",
+                                task_id, exc, exc_info=True,
+                            )
+                            await db.update_task_status(
+                                task_id, "failed", result={"error": str(exc)}
+                            )
+
+            except redis.ConnectionError as exc:
+                log.error("Lost Redis connection: %s — retrying in 5s.", exc)
+                await asyncio.sleep(5)
+
+    finally:
+        # Always close the PG pool, even if the loop exits due to an exception.
+        await db.close_pool()
 
     log.info("Shutdown flag set. Worker '%s' exiting cleanly.", CONSUMER_NAME)
 
@@ -201,4 +242,4 @@ def run(client: redis.Redis) -> None:
 if __name__ == "__main__":
     r = connect_redis()
     ensure_consumer_group(r)
-    run(r)
+    asyncio.run(run(r))

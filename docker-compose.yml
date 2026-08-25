@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # NexusFlow — docker-compose.yml
 # =============================================================================
 # Local development environment that wires together all four services:
@@ -49,6 +49,7 @@ services:
       POSTGRES_DB:       ${POSTGRES_DB:-nexusflow}
     volumes:
       - postgres_data:/var/lib/postgresql/data   # persist DB files
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql  # schema bootstrap
     networks:
       - nexusflow_net
     healthcheck:
@@ -109,7 +110,7 @@ services:
       redis:
         condition: service_healthy   # wait until redis-cli ping passes
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      test: ["CMD-SHELL", "python -c \"import urllib.request, sys; urllib.request.urlopen('http://localhost:8000/health', timeout=4); sys.exit(0)\""]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -131,8 +132,16 @@ services:
       CONSUMER_GROUP: workers
       CONSUMER_NAME:  worker-1       # override per replica: worker-2, worker-3…
       BLOCK_MS:       2000
+      # ---- PostgreSQL ----
+      POSTGRES_HOST:     postgres
+      POSTGRES_PORT:     5432
+      POSTGRES_USER:     ${POSTGRES_USER:-nexus}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nexuspassword}
+      POSTGRES_DB:       ${POSTGRES_DB:-nexusflow}
       # ---- App ----
       APP_ENV: development
     depends_on:
       redis:
-        condition: service_healthy   # worker only needs Redis, not postgres
+        condition: service_healthy
+      postgres:
+        condition: service_healthy   # worker needs PG to persist task state

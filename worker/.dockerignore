@@ -1,0 +1,41 @@
+# =============================================================================
+# NexusFlow — worker/.dockerignore
+# =============================================================================
+# Build context: ./worker  (set in docker-compose.yml)
+# Docker reads this file relative to the build context, so it applies exactly
+# to the worker/ directory that is sent to the daemon.
+# =============================================================================
+
+# ── Python runtime artefacts ──────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+
+# ── Secrets / local config ────────────────────────────────────────────────────
+.env
+*.env.*
+
+# ── Version control ───────────────────────────────────────────────────────────
+.git/
+.gitignore
+.gitattributes
+
+# ── macOS filesystem noise ────────────────────────────────────────────────────
+.DS_Store
+
+# ── Editor / IDE metadata ─────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── Test artefacts ────────────────────────────────────────────────────────────
+.pytest_cache/
+htmlcov/
+.coverage
