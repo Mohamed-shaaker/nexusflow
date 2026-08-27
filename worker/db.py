@@ -8,9 +8,10 @@ pattern as the gateway.  The pool is initialised once in ``main()`` and
 shared across all coroutine calls.
 
 State machine handled here:
-    pending  →  processing  (when XREADGROUP delivers the message)
-    processing  →  completed  (when XACK is called after success)
-    processing  →  failed     (when an exception is raised during processing)
+    pending     →  processing  (when XREADGROUP delivers the message)
+    processing  →  completed   (when XACK is called after success)
+    processing  →  pending     (transient retry: retry_count < max_retries)
+    processing  →  failed      (retries exhausted: retry_count >= max_retries)
 """
 
 import json
@@ -84,6 +85,23 @@ def _pool_or_raise() -> asyncpg.Pool:
 # ---------------------------------------------------------------------------
 
 
+async def fetch_task_retry_info(task_id: str) -> dict[str, Any]:
+    """
+    Fetch the current retry counters for a task row.
+
+    Returns a dict with keys ``retry_count`` and ``max_retries``.
+    Raises ``LookupError`` if the task_id is not found.
+    """
+    async with _pool_or_raise().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT retry_count, max_retries FROM tasks WHERE task_id = $1",
+            task_id,
+        )
+    if row is None:
+        raise LookupError(f"Task not found in database: task_id={task_id!r}")
+    return {"retry_count": row["retry_count"], "max_retries": row["max_retries"]}
+
+
 async def update_task_status(
     task_id: str,
     status: str,
@@ -116,3 +134,52 @@ async def update_task_status(
             now,
         )
     log.debug("Updated task  task_id=%s  status=%s", task_id, status)
+
+
+async def update_task_for_retry(task_id: str, error_message: str) -> None:
+    """
+    Atomically increment ``retry_count``, reset status to ``'pending'``,
+    and record the latest ``error_message``.
+
+    Called when a task fails but still has retries remaining.
+    """
+    now = datetime.now(tz=timezone.utc)
+    async with _pool_or_raise().acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE tasks
+               SET status        = 'pending',
+                   retry_count   = retry_count + 1,
+                   error_message = $2,
+                   updated_at    = $3
+             WHERE task_id = $1
+            """,
+            task_id,
+            error_message,
+            now,
+        )
+    log.debug("Queued retry  task_id=%s  error=%s", task_id, error_message)
+
+
+async def update_task_as_failed(task_id: str, error_message: str) -> None:
+    """
+    Mark a task as permanently ``'failed'`` and record the ``error_message``.
+
+    Called when ``retry_count >= max_retries`` — no further retries will occur.
+    """
+    now = datetime.now(tz=timezone.utc)
+    async with _pool_or_raise().acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE tasks
+               SET status        = 'failed',
+                   error_message = $2,
+                   updated_at    = $3
+             WHERE task_id = $1
+            """,
+            task_id,
+            error_message,
+            now,
+        )
+    log.debug("Marked failed  task_id=%s  error=%s", task_id, error_message)
+

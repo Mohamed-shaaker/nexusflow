@@ -5,13 +5,20 @@ Consumes tasks from a Redis Stream and processes them.
 
 The worker uses the Redis Streams "consumer group" model:
   - Multiple worker replicas can run simultaneously without duplicating work.
-  - Unacknowledged messages are automatically re-delivered on restart (at-least-once delivery).
-  - XACK removes a message from the Pending Entries List (PEL) once processing succeeds.
+  - XACK removes a message from the Pending Entries List (PEL) once processing
+    succeeds or permanently fails (retries exhausted).
+  - On a transient failure with retries remaining, the original PEL message is
+    XACK'd and a *new* message is re-published to the stream, ensuring a clean
+    re-delivery without blocking the PEL with stale entries.
 
 PostgreSQL state transitions (via db.py):
-  XREADGROUP delivers message  →  status set to 'processing'
-  Processing succeeds + XACK   →  status set to 'completed'
-  Processing raises exception  →  status set to 'failed' (message stays in PEL)
+  XREADGROUP delivers message       →  status: 'processing'
+  Processing succeeds + XACK        →  status: 'completed'
+  Failure + retry_count < max_retries:
+      DB status reset to 'pending', retry_count incremented, XACK original
+      message, re-publish new message to stream
+  Failure + retry_count >= max_retries:
+      status: 'failed', XACK original message (drops from PEL permanently)
 
 Environment variables (with defaults):
   REDIS_HOST        Host of the Redis instance        (default: localhost)
@@ -20,6 +27,7 @@ Environment variables (with defaults):
   CONSUMER_GROUP    Consumer group name               (default: workers)
   CONSUMER_NAME     Unique name for this worker       (default: worker-1)
   BLOCK_MS          XREADGROUP block timeout in ms    (default: 2000)
+  REQUEUE_DELAY_MS  Delay before re-queuing a retry   (default: 1000)
   POSTGRES_HOST     PostgreSQL host                   (default: localhost)
   POSTGRES_PORT     PostgreSQL port                   (default: 5432)
   POSTGRES_USER     PostgreSQL user                   (default: nexus)
@@ -55,12 +63,13 @@ log = logging.getLogger("nexusflow.worker")
 # ---------------------------------------------------------------------------
 # Configuration — read from environment, fall back to safe defaults
 # ---------------------------------------------------------------------------
-REDIS_HOST     = os.getenv("REDIS_HOST", "localhost")
-REDIS_PORT     = int(os.getenv("REDIS_PORT", "6379"))
-STREAM_NAME    = os.getenv("STREAM_NAME", "tasks")
-CONSUMER_GROUP = os.getenv("CONSUMER_GROUP", "workers")
-CONSUMER_NAME  = os.getenv("CONSUMER_NAME", "worker-1")
-BLOCK_MS       = int(os.getenv("BLOCK_MS", "2000"))   # ms to block on XREADGROUP
+REDIS_HOST      = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT      = int(os.getenv("REDIS_PORT", "6379"))
+STREAM_NAME     = os.getenv("STREAM_NAME", "tasks")
+CONSUMER_GROUP  = os.getenv("CONSUMER_GROUP", "workers")
+CONSUMER_NAME   = os.getenv("CONSUMER_NAME", "worker-1")
+BLOCK_MS        = int(os.getenv("BLOCK_MS", "2000"))       # ms to block on XREADGROUP
+REQUEUE_DELAY_S = int(os.getenv("REQUEUE_DELAY_MS", "1000")) / 1000.0  # convert to seconds
 
 # ---------------------------------------------------------------------------
 # Graceful shutdown
@@ -141,18 +150,30 @@ async def process_task(task_id: str, fields: dict) -> dict:
 
     Replace the body of this function with real work:
     image resizing, sending an email, calling a downstream API, etc.
-    The function should raise an exception on failure so the message
-    is NOT acknowledged and will be re-delivered.
+    The function should raise an exception on failure so the caller
+    can apply the retry/failure policy.
 
     Returns a result dict that is persisted in PostgreSQL on success.
+
+    Simulated failure
+    -----------------
+    If the task ``name`` field equals ``"fail_task"``, a ``ValueError`` is
+    raised on every attempt.  Use this to exercise the retry path locally
+    without needing a real downstream service to misbehave.
     """
-    log.info("Processing task_id=%s  name=%s", task_id, fields.get("name", "unknown"))
+    task_name = fields.get("name", "unknown")
+    log.info("Processing task_id=%s  name=%s", task_id, task_name)
+
+    # ── Simulated failure for local testing ───────────────────────────────────
+    # Remove or guard with an env flag before deploying to production.
+    if task_name == "fail_task":
+        raise ValueError("Simulated failure for testing")
 
     # Simulate work (replace with actual async I/O or CPU-bound work via executor)
     await asyncio.sleep(0.1)
 
     log.info("Task completed  task_id=%s", task_id)
-    return {"processed": True, "name": fields.get("name")}
+    return {"processed": True, "name": task_name}
 
 
 # ---------------------------------------------------------------------------
@@ -200,29 +221,71 @@ async def run(client: redis.Redis) -> None:
                         # message fields (distinct from Redis's own msg_id).
                         task_id: str = fields.get("task_id", msg_id)
 
-                        # ── 1. Mark as processing ─────────────────────────────
+                        # ── 1. Fetch retry state & mark as processing ─────────
+                        retry_info = await db.fetch_task_retry_info(task_id)
+                        retry_count = retry_info["retry_count"]
+                        max_retries = retry_info["max_retries"]
+
+                        log.info(
+                            "Picked up task_id=%s  attempt=%d/%d",
+                            task_id, retry_count + 1, max_retries + 1,
+                        )
                         await db.update_task_status(task_id, "processing")
 
                         try:
                             result = await process_task(task_id, fields)
 
-                            # ── 2a. Success: ACK + mark completed ────────────
+                            # ── 2a. Success: ACK + mark completed ─────────────
                             client.xack(STREAM_NAME, CONSUMER_GROUP, msg_id)
                             await db.update_task_status(
                                 task_id, "completed", result=result
                             )
+                            log.info("task_id=%s completed successfully.", task_id)
 
                         except Exception as exc:  # noqa: BLE001
-                            # ── 2b. Failure: do NOT ACK, mark failed ─────────
-                            # The message stays in the PEL and will be reclaimed
-                            # after a timeout, enabling at-least-once retries.
+                            error_str = str(exc)
                             log.error(
-                                "Failed to process task_id=%s: %s",
-                                task_id, exc, exc_info=True,
+                                "task_id=%s failed (attempt %d/%d): %s",
+                                task_id, retry_count + 1, max_retries + 1,
+                                error_str, exc_info=True,
                             )
-                            await db.update_task_status(
-                                task_id, "failed", result={"error": str(exc)}
-                            )
+
+                            if retry_count < max_retries:
+                                # ── 2b. Transient failure — schedule a retry ───
+                                # 1. Persist the incremented retry_count and reset
+                                #    status to 'pending' so the task is visible as
+                                #    "waiting to retry" in the UI/API.
+                                await db.update_task_for_retry(task_id, error_str)
+
+                                # 2. Brief back-off before re-queuing so we don't
+                                #    hammer a struggling downstream service.
+                                await asyncio.sleep(REQUEUE_DELAY_S)
+
+                                # 3. Re-publish the original message fields as a
+                                #    brand-new stream entry so any consumer in the
+                                #    group can pick it up cleanly.
+                                client.xadd(STREAM_NAME, fields)
+                                log.warning(
+                                    "task_id=%s re-queued for retry %d/%d.",
+                                    task_id, retry_count + 1, max_retries,
+                                )
+
+                                # 4. ACK the original message to remove it from the
+                                #    PEL — the new entry is now the authoritative one.
+                                client.xack(STREAM_NAME, CONSUMER_GROUP, msg_id)
+
+                            else:
+                                # ── 2c. Permanent failure — retries exhausted ──
+                                log.error(
+                                    "task_id=%s permanently failed after %d/%d attempts. "
+                                    "error_message=%s",
+                                    task_id, retry_count + 1, max_retries + 1, error_str,
+                                )
+                                await db.update_task_as_failed(task_id, error_str)
+
+                                # ACK so the dead message is cleared from the PEL
+                                # and does not block stream progress.
+                                client.xack(STREAM_NAME, CONSUMER_GROUP, msg_id)
 
             except redis.ConnectionError as exc:
                 log.error("Lost Redis connection: %s — retrying in 5s.", exc)
