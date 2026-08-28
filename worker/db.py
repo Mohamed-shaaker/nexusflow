@@ -14,6 +14,7 @@ State machine handled here:
     processing  →  failed      (retries exhausted: retry_count >= max_retries)
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -38,6 +39,10 @@ _DSN = (
     f"@{_PG_HOST}:{_PG_PORT}/{_PG_DB}"
 )
 
+# Retry configuration for PostgreSQL startup
+_PG_MAX_RETRIES = 10
+_PG_RETRY_DELAY = 2  # seconds between each attempt
+
 # ---------------------------------------------------------------------------
 # Connection pool (module-level singleton)
 # ---------------------------------------------------------------------------
@@ -49,17 +54,44 @@ async def init_pool(min_size: int = 1, max_size: int = 5) -> None:
     Open the asyncpg connection pool.  Call once at worker startup.
 
     The worker processes tasks sequentially so a small pool (1–5) is enough.
+
+    Retries up to ``_PG_MAX_RETRIES`` times with a fixed ``_PG_RETRY_DELAY``
+    second back-off to survive the race condition where this process starts
+    before PostgreSQL finishes initialising (mirrors the Redis retry strategy).
     """
     global _pool
-    _pool = await asyncpg.create_pool(
-        dsn=_DSN,
-        min_size=min_size,
-        max_size=max_size,
-    )
-    log.info(
-        "PostgreSQL pool ready  host=%s db=%s  min=%d max=%d",
-        _PG_HOST, _PG_DB, min_size, max_size,
-    )
+
+    last_exc: Exception | None = None
+    for attempt in range(1, _PG_MAX_RETRIES + 1):
+        try:
+            _pool = await asyncpg.create_pool(
+                dsn=_DSN,
+                min_size=min_size,
+                max_size=max_size,
+            )
+            log.info(
+                "PostgreSQL pool ready  host=%s db=%s  min=%d max=%d",
+                _PG_HOST, _PG_DB, min_size, max_size,
+            )
+            return  # success — exit the retry loop
+        except (
+            asyncpg.PostgresError,
+            asyncpg.exceptions.CannotConnectNowError,
+            ConnectionRefusedError,
+            OSError,
+        ) as exc:
+            last_exc = exc
+            log.warning(
+                "PostgreSQL not ready (attempt %d/%d): %s — retrying in %ds …",
+                attempt, _PG_MAX_RETRIES, exc, _PG_RETRY_DELAY,
+            )
+            await asyncio.sleep(_PG_RETRY_DELAY)
+
+    # All attempts exhausted — re-raise the last exception so the caller
+    # (and Docker's restart policy) can handle it.
+    raise RuntimeError(
+        f"Could not connect to PostgreSQL after {_PG_MAX_RETRIES} attempts."
+    ) from last_exc
 
 
 async def close_pool() -> None:

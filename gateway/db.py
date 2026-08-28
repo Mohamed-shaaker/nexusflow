@@ -97,16 +97,21 @@ async def create_task(
     name: str,
     payload: dict[str, Any],
     created_at: str,
+    idempotency_key: str | None = None,
 ) -> None:
     """
     Insert a new task row with status='pending'.
 
     Parameters
     ----------
-    task_id:    UUID string assigned by the gateway.
-    name:       Human-readable task name.
-    payload:    Arbitrary JSON submitted by the caller.
-    created_at: ISO-8601 UTC timestamp string from the gateway.
+    task_id:         UUID string assigned by the gateway.
+    name:            Human-readable task name.
+    payload:         Arbitrary JSON submitted by the caller.
+    created_at:      ISO-8601 UTC timestamp string from the gateway.
+    idempotency_key: Optional caller-supplied deduplication key.  When set,
+                     the partial unique index on the column prevents a second
+                     INSERT with the same key from succeeding — the caller
+                     should check for duplicates *before* calling this function.
     """
     # asyncpg requires the JSONB value to be a JSON *string*, not a dict.
     payload_json = json.dumps(payload)
@@ -115,15 +120,48 @@ async def create_task(
     async with _pool_or_raise().acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO tasks (task_id, name, status, payload, created_at, updated_at)
-            VALUES ($1, $2, 'pending', $3::jsonb, $4, $4)
+            INSERT INTO tasks (task_id, name, status, payload, idempotency_key,
+                               created_at, updated_at)
+            VALUES ($1, $2, 'pending', $3::jsonb, $4, $5, $5)
             """,
             task_id,
             name,
             payload_json,
+            idempotency_key,
             ts,
         )
-    log.debug("Inserted task  task_id=%s  status=pending", task_id)
+    log.debug(
+        "Inserted task  task_id=%s  idempotency_key=%s  status=pending",
+        task_id, idempotency_key,
+    )
+
+async def fetch_task_by_idempotency_key(key: str) -> dict[str, Any] | None:
+    """
+    Look up a task by its ``idempotency_key``.
+
+    Returns the same slim dict shape used by ``TaskResponse`` so the endpoint
+    can return it directly without mapping to a different schema.
+    Returns ``None`` if no task with that key exists.
+    """
+    async with _pool_or_raise().acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT task_id, name, status, created_at
+              FROM tasks
+             WHERE idempotency_key = $1
+            """,
+            key,
+        )
+
+    if row is None:
+        return None
+
+    return {
+        "task_id":    row["task_id"],
+        "name":       row["name"],
+        "status":     row["status"],
+        "accepted_at": row["created_at"].isoformat(),
+    }
 
 
 async def update_task_status(
@@ -166,11 +204,16 @@ async def fetch_task(task_id: str) -> dict[str, Any] | None:
 
     Returns a plain dict (JSON-serialisable) or ``None`` if not found.
     asyncpg returns JSONB columns as Python dicts/lists automatically.
+
+    Includes retry telemetry fields (``retry_count``, ``max_retries``,
+    ``error_message``) so callers can inspect failure details without
+    querying the database directly.
     """
     async with _pool_or_raise().acquire() as conn:
         row = await conn.fetchrow(
             """
             SELECT task_id, name, status, payload, result,
+                   retry_count, max_retries, error_message,
                    created_at, updated_at
               FROM tasks
              WHERE task_id = $1
@@ -182,11 +225,14 @@ async def fetch_task(task_id: str) -> dict[str, Any] | None:
         return None
 
     return {
-        "task_id":    row["task_id"],
-        "name":       row["name"],
-        "status":     row["status"],
-        "payload":    row["payload"],   # already a dict — asyncpg deserialises JSONB
-        "result":     row["result"],
-        "created_at": row["created_at"].isoformat(),
-        "updated_at": row["updated_at"].isoformat(),
+        "task_id":       row["task_id"],
+        "name":          row["name"],
+        "status":        row["status"],
+        "payload":       row["payload"],   # already a dict — asyncpg deserialises JSONB
+        "result":        row["result"],
+        "retry_count":   row["retry_count"],
+        "max_retries":   row["max_retries"],
+        "error_message": row["error_message"],
+        "created_at":    row["created_at"].isoformat(),
+        "updated_at":    row["updated_at"].isoformat(),
     }

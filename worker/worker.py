@@ -21,18 +21,23 @@ PostgreSQL state transitions (via db.py):
       status: 'failed', XACK original message (drops from PEL permanently)
 
 Environment variables (with defaults):
-  REDIS_HOST        Host of the Redis instance        (default: localhost)
-  REDIS_PORT        Port of the Redis instance        (default: 6379)
-  STREAM_NAME       Name of the Redis stream          (default: tasks)
-  CONSUMER_GROUP    Consumer group name               (default: workers)
-  CONSUMER_NAME     Unique name for this worker       (default: worker-1)
-  BLOCK_MS          XREADGROUP block timeout in ms    (default: 2000)
-  REQUEUE_DELAY_MS  Delay before re-queuing a retry   (default: 1000)
-  POSTGRES_HOST     PostgreSQL host                   (default: localhost)
-  POSTGRES_PORT     PostgreSQL port                   (default: 5432)
-  POSTGRES_USER     PostgreSQL user                   (default: nexus)
-  POSTGRES_PASSWORD PostgreSQL password               (default: nexuspassword)
-  POSTGRES_DB       PostgreSQL database               (default: nexusflow)
+  REDIS_HOST             Host of the Redis instance                  (default: localhost)
+  REDIS_PORT             Port of the Redis instance                  (default: 6379)
+  STREAM_NAME            Name of the Redis stream                    (default: tasks)
+  CONSUMER_GROUP         Consumer group name                         (default: workers)
+  CONSUMER_NAME          Unique name for this worker                 (default: worker-1)
+  BLOCK_MS               XREADGROUP block timeout in ms              (default: 2000)
+  REQUEUE_BASE_DELAY_MS  Base retry back-off in ms (doubles each     (default: 1000)
+                         retry up to REQUEUE_MAX_DELAY_MS)
+  REQUEUE_MAX_DELAY_MS   Cap on exponential back-off in ms           (default: 30000)
+  PEL_SCAN_INTERVAL_S    How often the PEL reclaim loop runs (s)     (default: 30)
+  PEL_IDLE_THRESHOLD_MS  Min idle time before a PEL entry is         (default: 60000)
+                         reclaimed by XCLAIM (ms)
+  POSTGRES_HOST          PostgreSQL host                             (default: localhost)
+  POSTGRES_PORT          PostgreSQL port                             (default: 5432)
+  POSTGRES_USER          PostgreSQL user                             (default: nexus)
+  POSTGRES_PASSWORD      PostgreSQL password                         (default: nexuspassword)
+  POSTGRES_DB            PostgreSQL database                         (default: nexusflow)
 """
 
 import asyncio
@@ -68,8 +73,15 @@ REDIS_PORT      = int(os.getenv("REDIS_PORT", "6379"))
 STREAM_NAME     = os.getenv("STREAM_NAME", "tasks")
 CONSUMER_GROUP  = os.getenv("CONSUMER_GROUP", "workers")
 CONSUMER_NAME   = os.getenv("CONSUMER_NAME", "worker-1")
-BLOCK_MS        = int(os.getenv("BLOCK_MS", "2000"))       # ms to block on XREADGROUP
-REQUEUE_DELAY_S = int(os.getenv("REQUEUE_DELAY_MS", "1000")) / 1000.0  # convert to seconds
+BLOCK_MS        = int(os.getenv("BLOCK_MS", "2000"))        # ms to block on XREADGROUP
+
+# Exponential back-off: delay = min(BASE * 2^(retry-1), MAX)
+REQUEUE_BASE_DELAY_S = int(os.getenv("REQUEUE_BASE_DELAY_MS", "1000")) / 1000.0
+REQUEUE_MAX_DELAY_S  = int(os.getenv("REQUEUE_MAX_DELAY_MS", "30000")) / 1000.0
+
+# PEL reclaim background task
+PEL_SCAN_INTERVAL_S   = int(os.getenv("PEL_SCAN_INTERVAL_S",   "30"))    # seconds between scans
+PEL_IDLE_THRESHOLD_MS = int(os.getenv("PEL_IDLE_THRESHOLD_MS", "60000")) # ms a msg must be idle before reclaim
 
 # ---------------------------------------------------------------------------
 # Graceful shutdown
@@ -177,6 +189,98 @@ async def process_task(task_id: str, fields: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# PEL reclaim background task
+# ---------------------------------------------------------------------------
+
+async def reclaim_idle_pel(client: redis.Redis) -> None:
+    """
+    Periodically scan the consumer group's Pending Entries List (PEL) and
+    reclaim messages that have been idle longer than ``PEL_IDLE_THRESHOLD_MS``.
+
+    Why this is needed
+    ------------------
+    When a worker crashes *after* XREADGROUP delivers a message but *before*
+    the worker can XACK (or re-queue) it, the message stays in the PEL
+    indefinitely — no other consumer will receive it because Redis considers
+    it "in flight".  XCLAIM lets us steal those orphaned messages and
+    re-publish them as fresh stream entries so the normal processing loop
+    picks them up again.
+
+    Flow per scan
+    -------------
+    1. XPENDING: list all pending messages in the group.
+    2. For each entry idle > PEL_IDLE_THRESHOLD_MS:
+       a. XCLAIM: transfer ownership to this worker.
+       b. Re-publish the message fields as a new stream entry.
+       c. XACK: remove the now-reclaimed entry from the PEL.
+    """
+    log.info(
+        "PEL reclaim task started  scan_interval=%ds  idle_threshold=%dms",
+        PEL_SCAN_INTERVAL_S, PEL_IDLE_THRESHOLD_MS,
+    )
+    while True:
+        try:
+            await asyncio.sleep(PEL_SCAN_INTERVAL_S)
+
+            # XPENDING returns a summary when called with no range args.
+            # Use the range form to get per-message idle times.
+            # Returns: list of [msg_id, consumer, idle_ms, delivery_count]
+            pending = client.xpending_range(
+                name=STREAM_NAME,
+                groupname=CONSUMER_GROUP,
+                min="-",
+                max="+",
+                count=100,  # process at most 100 orphaned messages per scan
+            )
+
+            if not pending:
+                continue
+
+            reclaimed = 0
+            for entry in pending:
+                msg_id   = entry["message_id"]
+                idle_ms  = entry["time_since_delivered"]
+
+                if idle_ms < PEL_IDLE_THRESHOLD_MS:
+                    continue  # message is still within the expected processing window
+
+                # XCLAIM transfers ownership; it returns the full message
+                # fields so we can re-publish without a separate XRANGE call.
+                claimed = client.xclaim(
+                    name=STREAM_NAME,
+                    groupname=CONSUMER_GROUP,
+                    consumername=CONSUMER_NAME,
+                    min_idle_time=PEL_IDLE_THRESHOLD_MS,
+                    message_ids=[msg_id],
+                )
+
+                for _claimed_id, fields in claimed:
+                    task_id = fields.get("task_id", msg_id)
+                    log.warning(
+                        "Reclaiming orphaned PEL message  msg_id=%s  task_id=%s  "
+                        "idle_ms=%d  delivery_count=%d",
+                        msg_id, task_id, idle_ms, entry["times_delivered"],
+                    )
+                    # Re-publish as a fresh stream entry so any consumer in
+                    # the group can pick it up through the normal > delivery.
+                    client.xadd(STREAM_NAME, fields)
+                    # Remove the stale PEL entry now that we have a new one.
+                    client.xack(STREAM_NAME, CONSUMER_GROUP, msg_id)
+                    reclaimed += 1
+
+            if reclaimed:
+                log.info("PEL scan complete  reclaimed=%d message(s).", reclaimed)
+
+        except asyncio.CancelledError:
+            log.info("PEL reclaim task cancelled — shutting down.")
+            return
+        except redis.ConnectionError as exc:
+            log.error("PEL reclaim: lost Redis connection: %s — will retry next scan.", exc)
+        except Exception as exc:  # noqa: BLE001
+            log.error("PEL reclaim: unexpected error: %s", exc, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # Main async loop
 # ---------------------------------------------------------------------------
 
@@ -195,6 +299,12 @@ async def run(client: redis.Redis) -> None:
 
     # Initialise the PostgreSQL connection pool before entering the loop.
     await db.init_pool()
+
+    # Launch the PEL reclaim background task.
+    pel_task = asyncio.create_task(
+        reclaim_idle_pel(client),
+        name="pel-reclaim",
+    )
 
     try:
         while not _shutdown:
@@ -257,9 +367,21 @@ async def run(client: redis.Redis) -> None:
                                 #    "waiting to retry" in the UI/API.
                                 await db.update_task_for_retry(task_id, error_str)
 
-                                # 2. Brief back-off before re-queuing so we don't
+                                # 2. Exponential back-off before re-queuing so we don't
                                 #    hammer a struggling downstream service.
-                                await asyncio.sleep(REQUEUE_DELAY_S)
+                                #    Formula: BASE * 2^(retry_count - 1), capped at MAX.
+                                #    retry_count is still the *pre-increment* value here
+                                #    (the DB increments it inside update_task_for_retry),
+                                #    so attempt 1→BASE*1s, attempt 2→BASE*2s, attempt 3→BASE*4s …
+                                backoff_s = min(
+                                    REQUEUE_BASE_DELAY_S * (2 ** max(retry_count - 1, 0)),
+                                    REQUEUE_MAX_DELAY_S,
+                                )
+                                log.info(
+                                    "task_id=%s back-off %.1fs before retry %d/%d.",
+                                    task_id, backoff_s, retry_count + 1, max_retries,
+                                )
+                                await asyncio.sleep(backoff_s)
 
                                 # 3. Re-publish the original message fields as a
                                 #    brand-new stream entry so any consumer in the
@@ -292,6 +414,13 @@ async def run(client: redis.Redis) -> None:
                 await asyncio.sleep(5)
 
     finally:
+        # Cancel the PEL background task and wait for it to finish cleanly.
+        pel_task.cancel()
+        try:
+            await pel_task
+        except asyncio.CancelledError:
+            pass  # expected — the task raised CancelledError on cancel()
+
         # Always close the PG pool, even if the loop exits due to an exception.
         await db.close_pool()
 
