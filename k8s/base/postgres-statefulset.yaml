@@ -1,0 +1,226 @@
+# =============================================================================
+# NexusFlow — k8s/base/postgres-statefulset.yaml
+# =============================================================================
+# Postgres is modelled as a StatefulSet (not a Deployment) because:
+#  • StatefulSets give each pod a stable network identity and an ordered
+#    rolling update strategy — important for single-node Postgres.
+#  • volumeClaimTemplates provision the PVC automatically and bind it
+#    permanently to the pod, surviving pod restarts and node re-schedules.
+#
+# Resources in this file (in apply order):
+#   1. ConfigMap  — init.sql schema bootstrap
+#   2. PersistentVolumeClaim (standalone PVC for non-StatefulSet clusters)
+#   3. StatefulSet
+#   4. Service (ClusterIP headless + standard)
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# 1. Init SQL ConfigMap
+#    Mounted at /docker-entrypoint-initdb.d/ so the official postgres image
+#    executes it once on first start (only when /var/lib/postgresql/data is
+#    empty, i.e. brand-new PVC).
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init-sql
+  namespace: nexusflow
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: nexusflow
+data:
+  init.sql: |
+    -- NexusFlow schema bootstrap
+    CREATE TABLE IF NOT EXISTS tasks (
+        task_id         VARCHAR(64)  PRIMARY KEY,
+        name            VARCHAR(128) NOT NULL,
+        status          VARCHAR(32)  NOT NULL DEFAULT ''pending'',
+        payload         JSONB,
+        result          JSONB,
+        retry_count     INTEGER      NOT NULL DEFAULT 0,
+        max_retries     INTEGER      NOT NULL DEFAULT 3,
+        error_message   TEXT,
+        idempotency_key VARCHAR(255),
+        created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+        updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_tasks_status
+        ON tasks (status);
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idempotency_key
+        ON tasks (idempotency_key)
+        WHERE idempotency_key IS NOT NULL;
+
+---
+# ---------------------------------------------------------------------------
+# 2. StatefulSet
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: nexusflow
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: nexusflow
+spec:
+  serviceName: postgres-headless   # must match the headless Service below
+  replicas: 1                      # single-primary; scale-out requires Patroni/CloudNativePG
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/component: database
+        app.kubernetes.io/part-of: nexusflow
+    spec:
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        fsGroup: 999          # postgres GID — ensures the data volume is writable by uid 999
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: nexusflow-secrets
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nexusflow-secrets
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: nexusflow-config
+                  key: POSTGRES_DB
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+            - name: init-sql
+              mountPath: /docker-entrypoint-initdb.d/init.sql
+              subPath: init.sql
+              readOnly: true
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "1Gi"
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -h
+                - localhost
+                - -p
+                - "5432"
+                - -U
+                - $(POSTGRES_USER)
+                - -d
+                - $(POSTGRES_DB)
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -h
+                - localhost
+                - -p
+                - "5432"
+                - -U
+                - $(POSTGRES_USER)
+                - -d
+                - $(POSTGRES_DB)
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false   # postgres writes to /tmp and /run
+      volumes:
+        - name: init-sql
+          configMap:
+            name: postgres-init-sql
+  # VolumeClaimTemplates create a dedicated PVC per pod.
+  # In single-replica mode this is equivalent to a standalone PVC, but the
+  # StatefulSet pattern keeps the PVC bound across pod restarts.
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+        labels:
+          app.kubernetes.io/name: postgres
+          app.kubernetes.io/part-of: nexusflow
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+        # storageClassName is intentionally omitted to use the cluster default.
+        # Override in overlays: e.g., gp3 on EKS, standard on Minikube.
+
+---
+# ---------------------------------------------------------------------------
+# 3a. Headless Service — for StatefulSet DNS (postgres-0.postgres-headless)
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-headless
+  namespace: nexusflow
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: nexusflow
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+
+---
+# ---------------------------------------------------------------------------
+# 3b. ClusterIP Service — stable DNS endpoint for application pods
+#     Use "postgres:5432" in DATABASE_URL — this routes to postgres-0.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: nexusflow
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: nexusflow
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      protocol: TCP

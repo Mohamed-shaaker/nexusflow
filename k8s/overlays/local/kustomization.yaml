@@ -1,0 +1,124 @@
+# =============================================================================
+# NexusFlow — k8s/overlays/local/kustomization.yaml
+# =============================================================================
+# Local overlay for Minikube / Kind / k3s development.
+#
+# Differences from base:
+#   • APP_ENV set to "development"
+#   • Replica counts reduced to 1 (saves local resources)
+#   • Resource limits relaxed so the cluster is not starved on a laptop
+#   • NodePort service for gateway so you can curl localhost without ingress
+#   • Postgres storageClass set to "standard" (Minikube default)
+#   • A local dev Secret is generated inline (DO NOT use in production)
+#
+# Apply:
+#   kubectl apply -k k8s/overlays/local
+# Tear down:
+#   kubectl delete -k k8s/overlays/local
+# =============================================================================
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: nexusflow
+
+resources:
+  - ../../base
+
+# ---------------------------------------------------------------------------
+# Inline dev secret — safe for local clusters only.
+# In a team environment, use ExternalSecrets or Sealed Secrets instead.
+# ---------------------------------------------------------------------------
+secretGenerator:
+  - name: nexusflow-secrets
+    namespace: nexusflow
+    behavior: replace
+    literals:
+      - POSTGRES_USER=nexus
+      - POSTGRES_PASSWORD=localpassword123
+      - DATABASE_URL=postgresql://nexus:localpassword123@postgres:5432/nexusflow
+      - REDIS_URL=redis://redis:6379/0
+    options:
+      disableNameSuffixHash: true
+
+# ---------------------------------------------------------------------------
+# ConfigMap patches — override APP_ENV for development
+# ---------------------------------------------------------------------------
+configMapGenerator:
+  - name: nexusflow-config
+    namespace: nexusflow
+    behavior: merge
+    literals:
+      - APP_ENV=development
+      - PEL_SCAN_INTERVAL_S=10
+    options:
+      disableNameSuffixHash: true
+
+# ---------------------------------------------------------------------------
+# Strategic merge patches
+# ---------------------------------------------------------------------------
+patches:
+  # Reduce gateway to 1 replica locally
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: gateway
+        namespace: nexusflow
+      spec:
+        replicas: 1
+  # Reduce worker to 1 replica locally
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: worker
+        namespace: nexusflow
+      spec:
+        replicas: 1
+  # Expose gateway via NodePort so curl/browser works without an Ingress
+  - patch: |-
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: gateway
+        namespace: nexusflow
+      spec:
+        type: NodePort
+        ports:
+          - name: http
+            port: 80
+            targetPort: http
+            nodePort: 30800
+  # Use "standard" storageClass for Minikube/Kind (auto-provisioner)
+  - patch: |-
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: postgres
+        namespace: nexusflow
+      spec:
+        volumeClaimTemplates:
+          - metadata:
+              name: postgres-data
+            spec:
+              storageClassName: standard
+              accessModes: ["ReadWriteOnce"]
+              resources:
+                requests:
+                  storage: 2Gi
+  - patch: |-
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: redis
+        namespace: nexusflow
+      spec:
+        volumeClaimTemplates:
+          - metadata:
+              name: redis-data
+            spec:
+              storageClassName: standard
+              accessModes: ["ReadWriteOnce"]
+              resources:
+                requests:
+                  storage: 1Gi

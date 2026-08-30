@@ -1,0 +1,21 @@
+﻿# =============================================================================
+# NexusFlow — k8s/overlays/eks/patches/gateway-replicas.yaml
+# =============================================================================
+# Strategic merge patch: scale the gateway Deployment to 3 replicas on EKS.
+# Override this value in CI by using `kustomize edit set replicas` or by
+# applying an additional patch layer per environment (staging, prod).
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: nexusflow
+spec:
+  replicas: 3
+  # Production rollout strategy: always keep at least 2 pods healthy during
+  # a rolling deploy so the NLB continues to receive traffic.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1

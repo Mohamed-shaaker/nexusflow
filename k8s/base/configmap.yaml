@@ -1,0 +1,41 @@
+﻿# =============================================================================
+# NexusFlow — k8s/base/configmap.yaml
+# =============================================================================
+# Centralised non-sensitive runtime configuration for all NexusFlow pods.
+# Sensitive values (passwords, connection strings with credentials) live in
+# secrets.yaml / secrets-template.yaml instead.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nexusflow-config
+  namespace: nexusflow
+  labels:
+    app.kubernetes.io/part-of: nexusflow
+data:
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  REDIS_HOST: "redis"
+  REDIS_PORT: "6379"
+  STREAM_NAME: "tasks"
+
+  # ── Worker ─────────────────────────────────────────────────────────────────
+  CONSUMER_GROUP: "workers"
+  # CONSUMER_NAME is set per-pod via the Downward API (pod name) in the
+  # worker Deployment spec so each replica gets a unique name.
+  BLOCK_MS: "2000"
+
+  # Exponential back-off for task retries (in milliseconds)
+  REQUEUE_BASE_DELAY_MS: "1000"
+  REQUEUE_MAX_DELAY_MS: "30000"
+
+  # PEL (Pending Entries List) reclaim loop config
+  PEL_SCAN_INTERVAL_S: "30"
+  PEL_IDLE_THRESHOLD_MS: "60000"
+
+  # ── PostgreSQL (non-secret) ────────────────────────────────────────────────
+  POSTGRES_HOST: "postgres"
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: "nexusflow"
+
+  # ── Application ───────────────────────────────────────────────────────────
+  APP_ENV: "production"

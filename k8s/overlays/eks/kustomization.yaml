@@ -1,0 +1,145 @@
+﻿# =============================================================================
+# NexusFlow — k8s/overlays/eks/kustomization.yaml
+# =============================================================================
+# Production overlay for AWS EKS.
+#
+# Differences from base:
+#   • Gateway replicas scaled to 3, worker replicas scaled to 4
+#   • Gateway Service upgraded to LoadBalancer (AWS NLB via annotation)
+#   • Postgres StorageClass set to gp3 (EBS CSI driver required)
+#   • Resource requests/limits tuned for production node types
+#   • Secrets managed externally — secretGenerator is NOT used here.
+#     Use the External Secrets Operator or AWS Secrets Manager CSI driver.
+#
+# Prerequisites on the cluster:
+#   • AWS Load Balancer Controller (for NLB annotations)
+#   • EBS CSI Driver (for gp3 storage class)
+#   • External Secrets Operator (for secrets, optional)
+#
+# Apply:
+#   kubectl apply -k k8s/overlays/eks
+# Dry-run preview:
+#   kubectl kustomize k8s/overlays/eks | kubectl apply --dry-run=client -f -
+# =============================================================================
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: nexusflow
+
+bases:
+  - ../../base
+
+# ---------------------------------------------------------------------------
+# Images — pin concrete tags for production (avoids :latest drift)
+# ---------------------------------------------------------------------------
+images:
+  - name: nexusflow/gateway
+    newName: 123456789012.dkr.ecr.us-east-1.amazonaws.com/nexusflow-gateway
+    newTag: "1.0.0"
+  - name: nexusflow/worker
+    newName: 123456789012.dkr.ecr.us-east-1.amazonaws.com/nexusflow-worker
+    newTag: "1.0.0"
+
+# ---------------------------------------------------------------------------
+# Strategic merge patches
+# ---------------------------------------------------------------------------
+patches:
+  # Scale patches (separate files for CI override convenience)
+  - path: patches/gateway-replicas.yaml
+  - path: patches/worker-scaling.yaml
+
+  # Gateway Service: ClusterIP → NLB LoadBalancer
+  - patch: |-
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: gateway
+        namespace: nexusflow
+        annotations:
+          # AWS Load Balancer Controller annotations
+          service.beta.kubernetes.io/aws-load-balancer-type: "external"
+          service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+          service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+      spec:
+        type: LoadBalancer
+        ports:
+          - name: http
+            port: 80
+            targetPort: http
+            protocol: TCP
+
+  # Postgres: gp3 SSD storage (EBS CSI driver) + production PVC size
+  - patch: |-
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: postgres
+        namespace: nexusflow
+      spec:
+        volumeClaimTemplates:
+          - metadata:
+              name: postgres-data
+            spec:
+              storageClassName: gp3
+              accessModes: ["ReadWriteOnce"]
+              resources:
+                requests:
+                  storage: 50Gi
+
+  # Redis: gp3 storage for AOF persistence
+  - patch: |-
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: redis
+        namespace: nexusflow
+      spec:
+        volumeClaimTemplates:
+          - metadata:
+              name: redis-data
+            spec:
+              storageClassName: gp3
+              accessModes: ["ReadWriteOnce"]
+              resources:
+                requests:
+                  storage: 20Gi
+
+  # Gateway: production resource limits
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: gateway
+        namespace: nexusflow
+      spec:
+        template:
+          spec:
+            containers:
+              - name: gateway
+                resources:
+                  requests:
+                    cpu: "250m"
+                    memory: "256Mi"
+                  limits:
+                    cpu: "1000m"
+                    memory: "1Gi"
+
+  # Worker: production resource limits
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: worker
+        namespace: nexusflow
+      spec:
+        template:
+          spec:
+            containers:
+              - name: worker
+                resources:
+                  requests:
+                    cpu: "250m"
+                    memory: "256Mi"
+                  limits:
+                    cpu: "1000m"
+                    memory: "1Gi"

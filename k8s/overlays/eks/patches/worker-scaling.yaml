@@ -1,0 +1,35 @@
+﻿# =============================================================================
+# NexusFlow — k8s/overlays/eks/patches/worker-scaling.yaml
+# =============================================================================
+# Strategic merge patch: scale the worker Deployment to 4 replicas on EKS
+# and tune the rolling-update strategy for background-consumer workloads.
+#
+# Scaling notes:
+#   - Each worker pod is a unique Redis consumer-group member (CONSUMER_NAME
+#     is injected from pod metadata.name via the Downward API).
+#   - The PEL reclaim loop in worker.py automatically recovers orphaned
+#     messages from pods that are evicted mid-task, so it is safe to scale
+#     horizontally without message loss.
+#   - For HPA-driven autoscaling, pair this with a HorizontalPodAutoscaler
+#     targeting a custom metric (e.g., Redis stream length via KEDA).
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: nexusflow
+spec:
+  replicas: 4
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Allow one extra pod during rollout so throughput stays constant.
+      maxSurge: 1
+      # Keep one old pod running while the new one starts so no messages
+      # are missed during the transition window.
+      maxUnavailable: 1
+  template:
+    spec:
+      # Give in-flight tasks 90 s to complete before the pod is force-killed.
+      # Tune this to your p99 task duration + REQUEUE_MAX_DELAY_MS/1000.
+      terminationGracePeriodSeconds: 90

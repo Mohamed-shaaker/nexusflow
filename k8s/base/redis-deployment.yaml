@@ -1,0 +1,172 @@
+﻿# =============================================================================
+# NexusFlow — k8s/base/redis-deployment.yaml
+# =============================================================================
+# Redis is the task stream backbone (Redis Streams + consumer groups).
+# AOF persistence (appendonly yes, appendfsync everysec) ensures at most
+# one second of data loss on a hard crash — matching the docker-compose setup.
+#
+# Resources:
+#   1. ConfigMap  — redis.conf
+#   2. StatefulSet — single replica with AOF persistence
+#   3. Service    — ClusterIP on port 6379
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# 1. Redis configuration
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+  namespace: nexusflow
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/part-of: nexusflow
+data:
+  redis.conf: |
+    # Persistence: AOF with everysec fsync (matches docker-compose config)
+    appendonly yes
+    appendfsync everysec
+    # Keep RDB snapshots as a safety net
+    save 900 1
+    save 300 10
+    save 60 10000
+    # Max memory policy for stream workloads (adjust limit per overlay)
+    maxmemory-policy noeviction
+    # Disable protected-mode so in-cluster pods can connect without ACL
+    protected-mode no
+
+---
+# ---------------------------------------------------------------------------
+# 2. StatefulSet — ensures the data PVC is rebound on pod restarts
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: nexusflow
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/part-of: nexusflow
+spec:
+  serviceName: redis-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis
+        app.kubernetes.io/component: cache
+        app.kubernetes.io/part-of: nexusflow
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        fsGroup: 999
+        runAsNonRoot: true
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          imagePullPolicy: IfNotPresent
+          command:
+            - redis-server
+            - /etc/redis/redis.conf
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          volumeMounts:
+            - name: redis-data
+              mountPath: /data
+            - name: redis-config
+              mountPath: /etc/redis
+              readOnly: true
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false   # redis writes /data and /tmp
+            runAsUser: 999
+            runAsGroup: 999
+      volumes:
+        - name: redis-config
+          configMap:
+            name: redis-config
+  volumeClaimTemplates:
+    - metadata:
+        name: redis-data
+        labels:
+          app.kubernetes.io/name: redis
+          app.kubernetes.io/part-of: nexusflow
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
+
+---
+# ---------------------------------------------------------------------------
+# 3a. Headless Service (StatefulSet DNS)
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-headless
+  namespace: nexusflow
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/part-of: nexusflow
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+
+---
+# ---------------------------------------------------------------------------
+# 3b. ClusterIP Service — application pods reach Redis via "redis:6379"
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: nexusflow
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/part-of: nexusflow
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+      protocol: TCP

@@ -1,0 +1,12 @@
+﻿# =============================================================================
+# NexusFlow — k8s/base/namespace.yaml
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nexusflow
+  labels:
+    app.kubernetes.io/part-of: nexusflow
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
