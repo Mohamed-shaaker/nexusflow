@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # NexusFlow — k8s/base/worker-deployment.yaml
 # =============================================================================
 # Python background consumer: reads from Redis Streams via XREADGROUP,
@@ -112,11 +112,14 @@ spec:
               memory: "512Mi"
           livenessProbe:
             # Workers have no HTTP endpoint; probe the process via exec.
+            # worker.py is launched via exec-form CMD so it is PID 1 in the
+            # container. kill -0 is a shell builtin (no procps/pgrep needed)
+            # that checks whether PID 1 is alive without sending any signal.
             exec:
               command:
-                - pgrep
-                - -f
-                - worker.py
+                - sh
+                - -c
+                - "kill -0 1"
             initialDelaySeconds: 20
             periodSeconds: 30
             timeoutSeconds: 5
