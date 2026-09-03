@@ -228,8 +228,9 @@ async def fetch_task(task_id: str) -> dict[str, Any] | None:
         "task_id":       row["task_id"],
         "name":          row["name"],
         "status":        row["status"],
-        "payload":       row["payload"],   # already a dict — asyncpg deserialises JSONB
-        "result":        row["result"],
+        # asyncpg returns JSONB columns as raw JSON strings, not dicts — parse them.
+        "payload":       json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"],
+        "result":        json.loads(row["result"])  if isinstance(row["result"],  str) else row["result"],
         "retry_count":   row["retry_count"],
         "max_retries":   row["max_retries"],
         "error_message": row["error_message"],

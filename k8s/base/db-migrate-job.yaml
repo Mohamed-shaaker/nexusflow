@@ -1,0 +1,101 @@
+# =============================================================================
+# NexusFlow — k8s/base/db-migrate-job.yaml
+# =============================================================================
+# One-shot Job that applies the NexusFlow schema to PostgreSQL.
+#
+# Why a Job instead of relying on /docker-entrypoint-initdb.d/:
+#   The official postgres image only runs init scripts on the very first start
+#   (when PGDATA is empty). If the PVC already contains data — e.g. after a
+#   pod restart or cluster reset — the scripts are silently skipped and the
+#   "tasks" table never gets created.
+#
+#   This Job runs every time "kubectl apply" is executed (because the name is
+#   fixed). It uses CREATE TABLE IF NOT EXISTS / CREATE INDEX IF NOT EXISTS, so
+#   it is fully idempotent — safe to run against an already-migrated database.
+#
+# Ordering guarantee:
+#   Gateway and Worker pods have an init container ("wait-for-migration") that
+#   polls until this Job reaches Succeeded status, so application pods never
+#   start against an incomplete schema.
+#
+# Cleanup:
+#   ttlSecondsAfterFinished: 300 — Kubernetes automatically removes the
+#   completed Job pod after 5 minutes, keeping the namespace tidy.
+# =============================================================================
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migrate
+  namespace: nexusflow
+  labels:
+    app.kubernetes.io/name: db-migrate
+    app.kubernetes.io/component: migration
+    app.kubernetes.io/part-of: nexusflow
+spec:
+  # Retry up to 3 times if psql exits non-zero (e.g. postgres not yet ready).
+  backoffLimit: 3
+  # Auto-delete the Job and its pod 5 minutes after completion.
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: db-migrate
+        app.kubernetes.io/component: migration
+        app.kubernetes.io/part-of: nexusflow
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999    # postgres image uid
+        runAsGroup: 999
+      initContainers:
+        # Wait until PostgreSQL is accepting connections before running psql.
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z postgres 5432; do
+                echo "Waiting for postgres..."; sleep 2;
+              done
+              echo "PostgreSQL is ready."
+      containers:
+        - name: migrate
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              echo "Running NexusFlow schema migration..."
+              psql "$DATABASE_URL" -f /sql/init.sql
+              echo "Migration complete."
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: nexusflow-secrets
+                  key: DATABASE_URL
+          volumeMounts:
+            - name: init-sql
+              mountPath: /sql/init.sql
+              subPath: init.sql
+              readOnly: true
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: init-sql
+          configMap:
+            name: postgres-init-sql

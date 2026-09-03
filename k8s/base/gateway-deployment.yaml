@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # NexusFlow — k8s/base/gateway-deployment.yaml
 # =============================================================================
 # FastAPI HTTP gateway: accepts task submissions, proxies to Redis stream,
@@ -66,12 +66,27 @@ spec:
               until nc -z redis 6379; do
                 echo "Waiting for redis..."; sleep 2;
               done
+        # Wait for the db-migrate Job to reach Succeeded status before
+        # starting the gateway — guarantees the tasks table exists.
+        - name: wait-for-migration
+          image: bitnami/kubectl:latest
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for db-migrate Job to complete..."
+              until kubectl get job db-migrate -n nexusflow \
+                    -o jsonpath='{.status.succeeded}' 2>/dev/null | grep -q "1"; do
+                echo "Migration not yet complete, retrying in 3s..."; sleep 3;
+              done
+              echo "Migration complete — starting gateway."
       containers:
         - name: gateway
-          # TODO: replace with your registry image, e.g.:
-          #   image: 123456789.dkr.ecr.us-east-1.amazonaws.com/nexusflow-gateway:latest
-          image: nexusflow/gateway:latest
-          imagePullPolicy: Always
+          # Local minikube image — built with:
+          #   docker build -t nexusflow-gateway:latest ./gateway
+          #   minikube image load nexusflow-gateway:latest
+          image: nexusflow-gateway:latest
+          imagePullPolicy: IfNotPresent
           ports:
             - name: http
               containerPort: 8000
@@ -132,10 +147,18 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            - name: db-patch
+              mountPath: /app/db.py
+              subPath: db.py
+              readOnly: true
       volumes:
         # Writable /tmp scratch space while keeping root FS read-only.
         - name: tmp
           emptyDir: {}
+        # Patched db.py with JSONB fix — mounted over the image's read-only /app/db.py
+        - name: db-patch
+          configMap:
+            name: gateway-db-patch
 
 ---
 # ---------------------------------------------------------------------------

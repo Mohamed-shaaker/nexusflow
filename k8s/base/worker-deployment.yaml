@@ -65,6 +65,20 @@ spec:
               until nc -z redis 6379; do
                 echo "Waiting for redis..."; sleep 2;
               done
+        # Wait for the db-migrate Job to reach Succeeded status before
+        # starting the worker — guarantees the tasks table exists.
+        - name: wait-for-migration
+          image: bitnami/kubectl:latest
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for db-migrate Job to complete..."
+              until kubectl get job db-migrate -n nexusflow \
+                    -o jsonpath='{.status.succeeded}' 2>/dev/null | grep -q "1"; do
+                echo "Migration not yet complete, retrying in 3s..."; sleep 3;
+              done
+              echo "Migration complete — starting worker."
       containers:
         - name: worker
           # TODO: replace with your registry image, e.g.:

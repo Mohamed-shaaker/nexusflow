@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # NexusFlow — k8s/base/kustomization.yaml
 # =============================================================================
 # This is the base Kustomize layer. Overlays (local/, eks/) reference this
@@ -19,5 +19,6 @@ resources:
   - secrets-template.yaml
   - postgres-statefulset.yaml
   - redis-deployment.yaml
+  - db-migrate-job.yaml
   - gateway-deployment.yaml
   - worker-deployment.yaml
