@@ -1,0 +1,75 @@
+{{/*
+=============================================================================
+NexusFlow — templates/db-migrate-job.yaml
+One-shot idempotent schema migration Job.
+Runs every helm upgrade; CREATE TABLE/INDEX IF NOT EXISTS keeps it safe.
+Gateway and Worker init-containers wait for this Job to reach Succeeded.
+=============================================================================
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migrate
+  namespace: {{ include "nexusflow.namespace" . }}
+  labels:
+    {{- include "nexusflow.labels" . | nindent 4 }}
+    app.kubernetes.io/name: db-migrate
+    app.kubernetes.io/component: migration
+  annotations:
+    # post-install: runs after all chart resources are applied (Postgres is starting up).
+    # post-upgrade: re-runs migrations on every helm upgrade.
+    # before-hook-creation: deletes the old Job before creating a new one — avoids
+    #   the "spec.template is immutable" error when upgrading a plain Job resource.
+    # hook-succeeded: auto-deletes the Job after success (belt-and-suspenders with ttlSecondsAfterFinished).
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.migrate.backoffLimit }}
+  ttlSecondsAfterFinished: {{ .Values.migrate.ttlSecondsAfterFinished }}
+  template:
+    metadata:
+      labels:
+        {{- include "nexusflow.labels" . | nindent 8 }}
+        app.kubernetes.io/name: db-migrate
+        app.kubernetes.io/component: migration
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+      initContainers:
+        {{- include "nexusflow.initWaitForPostgres" . | nindent 8 }}
+      containers:
+        - name: migrate
+          image: "{{ .Values.migrate.image.repository }}:{{ .Values.migrate.image.tag }}"
+          imagePullPolicy: {{ .Values.migrate.image.pullPolicy }}
+          command:
+            - sh
+            - -c
+            - |
+              echo "Running NexusFlow schema migration..."
+              psql "$DATABASE_URL" -f /sql/init.sql
+              echo "Migration complete."
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "nexusflow.secretName" . }}
+                  key: DATABASE_URL
+          volumeMounts:
+            - name: init-sql
+              mountPath: /sql/init.sql
+              subPath: init.sql
+              readOnly: true
+          resources:
+            {{- toYaml .Values.migrate.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: init-sql
+          configMap:
+            name: postgres-init-sql

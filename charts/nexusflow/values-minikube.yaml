@@ -1,0 +1,49 @@
+﻿# =============================================================================
+# NexusFlow — values-minikube.yaml
+# Local dev overrides. No CPU requests so pods schedule even on a saturated node.
+# Memory requests are kept as a light guard against OOM evictions.
+# Usage:
+#   helm upgrade nexusflow ./charts/nexusflow -f charts/nexusflow/values-minikube.yaml --timeout 15m
+# =============================================================================
+
+gateway:
+  replicaCount: 1
+  resources:
+    requests:
+      memory: "64Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+
+worker:
+  replicaCount: 1
+  resources:
+    requests:
+      memory: "64Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+
+postgres:
+  resources:
+    requests:
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+
+redis:
+  resources:
+    requests:
+      memory: "64Mi"
+    limits:
+      cpu: "250m"
+      memory: "256Mi"
+
+migrate:
+  resources:
+    requests:
+      memory: "32Mi"
+    limits:
+      cpu: "200m"
+      memory: "128Mi"

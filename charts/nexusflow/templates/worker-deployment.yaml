@@ -1,0 +1,78 @@
+{{/*
+=============================================================================
+NexusFlow — templates/worker-deployment.yaml
+Redis Streams consumer: Deployment only (no Service needed).
+=============================================================================
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: {{ include "nexusflow.namespace" . }}
+  labels:
+    {{- include "nexusflow.labels" . | nindent 4 }}
+    app.kubernetes.io/name: worker
+    app.kubernetes.io/component: worker
+spec:
+  replicas: {{ .Values.worker.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: worker
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: {{ .Values.worker.strategy.maxSurge }}
+      maxUnavailable: {{ .Values.worker.strategy.maxUnavailable }}
+  template:
+    metadata:
+      labels:
+        {{- include "nexusflow.labels" . | nindent 8 }}
+        app.kubernetes.io/name: worker
+        app.kubernetes.io/component: worker
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+    spec:
+      # Allow time for the current task to finish on SIGTERM.
+      # Must be larger than REQUEUE_MAX_DELAY_MS/1000 + max task duration.
+      terminationGracePeriodSeconds: {{ .Values.worker.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- include "nexusflow.appPodSecurityContext" . | nindent 8 }}
+      initContainers:
+        {{- include "nexusflow.initWaitForPostgres" . | nindent 8 }}
+        {{- include "nexusflow.initWaitForRedis" . | nindent 8 }}
+      containers:
+        - name: worker
+          image: "{{ .Values.worker.image.repository }}:{{ .Values.worker.image.tag }}"
+          imagePullPolicy: {{ .Values.worker.image.pullPolicy }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "nexusflow.configMapName" . }}
+          env:
+            {{- include "nexusflow.secretEnvVars" . | nindent 12 }}
+            # Downward API: unique consumer identity per pod in the Redis consumer group.
+            - name: CONSUMER_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+          livenessProbe:
+            # Workers have no HTTP endpoint — probe via kill -0 on PID 1.
+            exec:
+              command:
+                - sh
+                - -c
+                - "kill -0 1"
+            initialDelaySeconds: {{ .Values.worker.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.worker.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.worker.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.worker.probes.liveness.failureThreshold }}
+          securityContext:
+            {{- include "nexusflow.containerSecurityContext" . | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

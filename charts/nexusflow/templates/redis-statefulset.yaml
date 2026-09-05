@@ -1,0 +1,165 @@
+﻿{{/*
+=============================================================================
+NexusFlow — templates/redis-statefulset.yaml
+Redis Streams backbone: ConfigMap + StatefulSet + headless + ClusterIP Service.
+=============================================================================
+*/}}
+
+# ---------------------------------------------------------------------------
+# 1. Redis configuration ConfigMap
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+  namespace: {{ include "nexusflow.namespace" . }}
+  labels:
+    {{- include "nexusflow.labels" . | nindent 4 }}
+    app.kubernetes.io/name: redis
+data:
+  redis.conf: |
+    # Persistence: AOF with everysec fsync
+    appendonly {{ .Values.redis.config.appendonly }}
+    appendfsync {{ .Values.redis.config.appendfsync }}
+    # RDB snapshots as a safety net
+    save 900 1
+    save 300 10
+    save 60 10000
+    # Max memory policy for stream workloads
+    maxmemory-policy {{ .Values.redis.config.maxmemoryPolicy }}
+    # Disable protected-mode for in-cluster access
+    protected-mode no
+
+---
+# ---------------------------------------------------------------------------
+# 2. StatefulSet — ensures the data PVC is rebound on pod restarts
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: {{ include "nexusflow.namespace" . }}
+  labels:
+    {{- include "nexusflow.labels" . | nindent 4 }}
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/component: cache
+spec:
+  serviceName: redis-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        {{- include "nexusflow.labels" . | nindent 8 }}
+        app.kubernetes.io/name: redis
+        app.kubernetes.io/component: cache
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.redis.terminationGracePeriodSeconds }}
+      securityContext:
+        fsGroup: 999
+        runAsNonRoot: true
+      containers:
+        - name: redis
+          image: "{{ .Values.redis.image.repository }}:{{ .Values.redis.image.tag }}"
+          imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
+          command:
+            - redis-server
+            - /etc/redis/redis.conf
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          volumeMounts:
+            - name: redis-data
+              mountPath: /data
+            - name: redis-config
+              mountPath: /etc/redis
+              readOnly: true
+          resources:
+            {{- toYaml .Values.redis.resources | nindent 12 }}
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: {{ .Values.redis.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.redis.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.redis.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.redis.probes.liveness.failureThreshold }}
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: {{ .Values.redis.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.redis.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.redis.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.redis.probes.readiness.failureThreshold }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false   # redis writes /data and /tmp
+            runAsUser: 999
+            runAsGroup: 999
+      volumes:
+        - name: redis-config
+          configMap:
+            name: redis-config
+  volumeClaimTemplates:
+    - metadata:
+        name: redis-data
+        labels:
+          {{- include "nexusflow.labels" . | nindent 10 }}
+          app.kubernetes.io/name: redis
+      spec:
+        accessModes:
+          - {{ .Values.redis.persistence.accessMode | quote }}
+        {{- if .Values.redis.persistence.storageClassName }}
+        storageClassName: {{ .Values.redis.persistence.storageClassName | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.redis.persistence.size }}
+
+---
+# ---------------------------------------------------------------------------
+# 3a. Headless Service — StatefulSet DNS
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-headless
+  namespace: {{ include "nexusflow.namespace" . }}
+  labels:
+    {{- include "nexusflow.labels" . | nindent 4 }}
+    app.kubernetes.io/name: redis
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+
+---
+# ---------------------------------------------------------------------------
+# 3b. ClusterIP Service — app pods reach Redis via "redis:6379"
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: {{ include "nexusflow.namespace" . }}
+  labels:
+    {{- include "nexusflow.labels" . | nindent 4 }}
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/component: cache
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+      protocol: TCP

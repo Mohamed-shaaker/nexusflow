@@ -1,0 +1,15 @@
+﻿{{/*
+=============================================================================
+NexusFlow — templates/namespace.yaml
+Create the namespace when namespaceCreate=true (default).
+=============================================================================
+*/}}
+{{- if .Values.namespaceCreate }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "nexusflow.namespace" . }}
+  labels:
+    {{- include "nexusflow.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ include "nexusflow.namespace" . }}
+{{- end }}

@@ -1,0 +1,117 @@
+{{/*
+=============================================================================
+NexusFlow — templates/gateway-deployment.yaml
+FastAPI HTTP gateway: Deployment + ClusterIP Service.
+=============================================================================
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: {{ include "nexusflow.namespace" . }}
+  labels:
+    {{- include "nexusflow.labels" . | nindent 4 }}
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/component: api
+spec:
+  replicas: {{ .Values.gateway.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gateway
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: {{ .Values.gateway.strategy.maxSurge }}
+      maxUnavailable: {{ .Values.gateway.strategy.maxUnavailable }}
+  template:
+    metadata:
+      labels:
+        {{- include "nexusflow.labels" . | nindent 8 }}
+        app.kubernetes.io/name: gateway
+        app.kubernetes.io/component: api
+      annotations:
+        # Trigger rolling restart when ConfigMap or Secret content changes.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.gateway.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- include "nexusflow.appPodSecurityContext" . | nindent 8 }}
+      initContainers:
+        {{- include "nexusflow.initWaitForPostgres" . | nindent 8 }}
+        {{- include "nexusflow.initWaitForRedis" . | nindent 8 }}
+      containers:
+        - name: gateway
+          image: "{{ .Values.gateway.image.repository }}:{{ .Values.gateway.image.tag }}"
+          imagePullPolicy: {{ .Values.gateway.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: {{ include "nexusflow.configMapName" . }}
+          env:
+            {{- include "nexusflow.secretEnvVars" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.gateway.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.gateway.probes.liveness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.gateway.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.gateway.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.gateway.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.gateway.probes.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.gateway.probes.readiness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.gateway.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.gateway.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.gateway.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.gateway.probes.readiness.failureThreshold }}
+          securityContext:
+            {{- include "nexusflow.containerSecurityContext" . | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: db-patch
+              mountPath: /app/db.py
+              subPath: db.py
+              readOnly: true
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: db-patch
+          configMap:
+            name: gateway-db-patch
+
+---
+{{/*
+=============================================================================
+Gateway Service — type driven by .Values.gateway.service.type
+=============================================================================
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: {{ include "nexusflow.namespace" . }}
+  labels:
+    {{- include "nexusflow.labels" . | nindent 4 }}
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/component: api
+  {{- with .Values.gateway.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.gateway.service.type }}
+  selector:
+    app.kubernetes.io/name: gateway
+  ports:
+    - name: http
+      port: {{ .Values.gateway.service.port }}
+      targetPort: http
+      protocol: TCP

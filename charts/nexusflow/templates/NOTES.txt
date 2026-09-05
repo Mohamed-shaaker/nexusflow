@@ -1,0 +1,65 @@
+﻿{{/*
+=============================================================================
+NexusFlow Helm Chart — NOTES.txt
+Printed to stdout after every helm install / upgrade.
+=============================================================================
+*/}}
+
+ _   _                     _____ _
+| \ | | _____  ___   _ ___|  ___| | _____      __
+|  \| |/ _ \ \/ / | | / __| |_  | |/ _ \ \ /\ / /
+| |\  |  __/>  <| |_| \__ \  _| | | (_) \ V  V /
+|_| \_|\___/_/\_\\__,_|___/_|   |_|\___/ \_/\_/
+
+Release : {{ .Release.Name }}
+Namespace: {{ include "nexusflow.namespace" . }}
+Chart   : {{ .Chart.Name }}-{{ .Chart.Version }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ Components
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Gateway  → {{ .Values.gateway.replicaCount }} replica(s)   image: {{ .Values.gateway.image.repository }}:{{ .Values.gateway.image.tag }}
+  Worker   → {{ .Values.worker.replicaCount }} replica(s)   image: {{ .Values.worker.image.repository }}:{{ .Values.worker.image.tag }}
+  Postgres → StatefulSet (1 replica)   storage: {{ .Values.postgres.persistence.size }}
+  Redis    → StatefulSet (1 replica)   storage: {{ .Values.redis.persistence.size }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ Gateway Service
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Type: {{ .Values.gateway.service.type }}
+{{- if eq .Values.gateway.service.type "LoadBalancer" }}
+  Run the following to get the external IP (may take a minute):
+    kubectl get svc gateway -n {{ include "nexusflow.namespace" . }} -w
+{{- else }}
+  To access the gateway locally:
+    kubectl port-forward svc/gateway 8080:{{ .Values.gateway.service.port }} -n {{ include "nexusflow.namespace" . }}
+  Then open: http://localhost:8080
+{{- end }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ Secrets
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{{- if .Values.secrets.createSecret }}
+  ⚠  Helm is managing the Secret (createSecret=true).
+     For production set createSecret=false and supply the
+     Secret externally (Sealed Secrets / ESO / ASM CSI).
+{{- else }}
+  ✔  External secret management is active (createSecret=false).
+     Ensure "nexusflow-secrets" exists before deploying.
+{{- end }}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ Useful commands
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # Watch rollout
+  kubectl rollout status deployment/gateway -n {{ include "nexusflow.namespace" . }}
+  kubectl rollout status deployment/worker  -n {{ include "nexusflow.namespace" . }}
+
+  # Tail gateway logs
+  kubectl logs -l app.kubernetes.io/name=gateway -n {{ include "nexusflow.namespace" . }} -f
+
+  # Tail worker logs
+  kubectl logs -l app.kubernetes.io/name=worker -n {{ include "nexusflow.namespace" . }} -f
+
+  # Check migration job
+  kubectl get job db-migrate -n {{ include "nexusflow.namespace" . }}

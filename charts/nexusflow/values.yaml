@@ -1,0 +1,242 @@
+# =============================================================================
+# NexusFlow Helm Chart — values.yaml
+# =============================================================================
+# All tuneable parameters for the NexusFlow chart.  Override any value with:
+#   helm install nexusflow ./charts/nexusflow -f my-values.yaml
+#   helm upgrade  nexusflow ./charts/nexusflow --set gateway.replicaCount=3
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Global
+# ---------------------------------------------------------------------------
+global:
+  # Applied to every resource as app.kubernetes.io/part-of
+  partOf: nexusflow
+  # Namespace to deploy into.  Create it first or set namespaceCreate=true.
+  namespace: nexusflow
+
+# Create the namespace as part of the Helm release (disable if pre-existing).
+namespaceCreate: true
+
+# ---------------------------------------------------------------------------
+# Gateway (FastAPI HTTP API)
+# ---------------------------------------------------------------------------
+gateway:
+  replicaCount: 2
+
+  image:
+    repository: nexusflow-gateway
+    tag: "1.0.0"
+    pullPolicy: IfNotPresent
+
+  service:
+    type: ClusterIP
+    port: 80
+    # AWS NLB annotations — uncomment for EKS production:
+    # annotations:
+    #   service.beta.kubernetes.io/aws-load-balancer-type: "external"
+    #   service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+    #   service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+    annotations: {}
+
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+
+  # Rolling-update strategy
+  strategy:
+    maxSurge: 1
+    maxUnavailable: 0
+
+  terminationGracePeriodSeconds: 30
+
+  probes:
+    liveness:
+      path: /health
+      initialDelaySeconds: 15
+      periodSeconds: 15
+      timeoutSeconds: 5
+      failureThreshold: 3
+    readiness:
+      path: /health
+      initialDelaySeconds: 10
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+
+# ---------------------------------------------------------------------------
+# Worker (Redis Streams consumer)
+# ---------------------------------------------------------------------------
+worker:
+  replicaCount: 2
+
+  image:
+    repository: nexusflow-worker
+    tag: "1.0.0"
+    pullPolicy: IfNotPresent
+
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+
+  strategy:
+    maxSurge: 1
+    maxUnavailable: 1
+
+  # Must be larger than REQUEUE_MAX_DELAY_MS/1000 + max task duration (seconds).
+  terminationGracePeriodSeconds: 90
+
+  probes:
+    liveness:
+      initialDelaySeconds: 20
+      periodSeconds: 30
+      timeoutSeconds: 5
+      failureThreshold: 3
+
+# ---------------------------------------------------------------------------
+# PostgreSQL
+# ---------------------------------------------------------------------------
+postgres:
+  image:
+    repository: postgres
+    tag: "16-alpine"
+    pullPolicy: IfNotPresent
+
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "1Gi"
+
+  persistence:
+    size: 10Gi
+    # Leave empty to use the cluster default StorageClass.
+    # Set to "gp3" for EKS, "standard" for Minikube, etc.
+    storageClassName: ""
+    accessMode: ReadWriteOnce
+
+  terminationGracePeriodSeconds: 60
+
+  probes:
+    liveness:
+      initialDelaySeconds: 30
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 6
+    readiness:
+      initialDelaySeconds: 10
+      periodSeconds: 5
+      timeoutSeconds: 3
+      failureThreshold: 3
+
+# ---------------------------------------------------------------------------
+# Redis
+# ---------------------------------------------------------------------------
+redis:
+  image:
+    repository: redis
+    tag: "7-alpine"
+    pullPolicy: IfNotPresent
+
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+
+  persistence:
+    size: 5Gi
+    storageClassName: ""
+    accessMode: ReadWriteOnce
+
+  terminationGracePeriodSeconds: 30
+
+  # redis.conf tunables
+  config:
+    maxmemoryPolicy: noeviction
+    appendonly: "yes"
+    appendfsync: "everysec"
+
+  probes:
+    liveness:
+      initialDelaySeconds: 15
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 6
+    readiness:
+      initialDelaySeconds: 5
+      periodSeconds: 5
+      timeoutSeconds: 3
+      failureThreshold: 3
+
+# ---------------------------------------------------------------------------
+# DB Migration Job
+# ---------------------------------------------------------------------------
+migrate:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 300
+
+  image:
+    repository: postgres
+    tag: "16-alpine"
+    pullPolicy: IfNotPresent
+
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "200m"
+      memory: "128Mi"
+
+# ---------------------------------------------------------------------------
+# Application ConfigMap (non-secret runtime config)
+# ---------------------------------------------------------------------------
+config:
+  redisHost: redis
+  redisPort: "6379"
+  streamName: tasks
+  consumerGroup: workers
+  blockMs: "2000"
+  requeueBaseDelayMs: "1000"
+  requeueMaxDelayMs: "30000"
+  pelScanIntervalS: "30"
+  pelIdleThresholdMs: "60000"
+  postgresHost: postgres
+  postgresPort: "5432"
+  postgresDb: nexusflow
+  appEnv: production
+
+# ---------------------------------------------------------------------------
+# Secrets
+# ---------------------------------------------------------------------------
+# Set createSecret=true to have Helm manage the Secret from plain-text values
+# (only for development/testing — store production secrets in a vault).
+# Set createSecret=false and supply the secret externally (Sealed Secrets,
+# External Secrets Operator, AWS Secrets Manager CSI, etc.).
+secrets:
+  createSecret: true
+  # Used only when createSecret=true:
+  postgresUser: nexus
+  postgresPassword: change-me-in-production
+  databaseUrl: postgresql://nexus:change-me-in-production@postgres:5432/nexusflow
+  redisUrl: redis://redis:6379/0
+
+# ---------------------------------------------------------------------------
+# Init containers — shared busybox image tag
+# ---------------------------------------------------------------------------
+initContainers:
+  busyboxImage: busybox:1.36
+  kubectlImage: bitnami/kubectl:latest

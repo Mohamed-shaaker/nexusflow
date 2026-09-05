@@ -1,0 +1,34 @@
+﻿{{/*
+=============================================================================
+NexusFlow — templates/configmap.yaml
+Centralised non-sensitive runtime config for all pods.
+=============================================================================
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "nexusflow.configMapName" . }}
+  namespace: {{ include "nexusflow.namespace" . }}
+  labels:
+    {{- include "nexusflow.labels" . | nindent 4 }}
+data:
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  REDIS_HOST:   {{ .Values.config.redisHost | quote }}
+  REDIS_PORT:   {{ .Values.config.redisPort | quote }}
+  STREAM_NAME:  {{ .Values.config.streamName | quote }}
+
+  # ── Worker ──────────────────────────────────────────────────────────────────
+  CONSUMER_GROUP:       {{ .Values.config.consumerGroup | quote }}
+  BLOCK_MS:             {{ .Values.config.blockMs | quote }}
+  REQUEUE_BASE_DELAY_MS: {{ .Values.config.requeueBaseDelayMs | quote }}
+  REQUEUE_MAX_DELAY_MS:  {{ .Values.config.requeueMaxDelayMs | quote }}
+  PEL_SCAN_INTERVAL_S:  {{ .Values.config.pelScanIntervalS | quote }}
+  PEL_IDLE_THRESHOLD_MS: {{ .Values.config.pelIdleThresholdMs | quote }}
+
+  # ── PostgreSQL (non-secret) ─────────────────────────────────────────────────
+  POSTGRES_HOST: {{ .Values.config.postgresHost | quote }}
+  POSTGRES_PORT: {{ .Values.config.postgresPort | quote }}
+  POSTGRES_DB:   {{ .Values.config.postgresDb | quote }}
+
+  # ── Application ─────────────────────────────────────────────────────────────
+  APP_ENV: {{ .Values.config.appEnv | quote }}

@@ -1,0 +1,208 @@
+﻿{{/*
+=============================================================================
+NexusFlow — templates/postgres-statefulset.yaml
+PostgreSQL: init-SQL ConfigMap + StatefulSet + headless Service + ClusterIP Service.
+=============================================================================
+*/}}
+
+# ---------------------------------------------------------------------------
+# 1. Init-SQL ConfigMap (schema bootstrap)
+#    Mounted at /docker-entrypoint-initdb.d/ and also used by db-migrate Job.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init-sql
+  namespace: {{ include "nexusflow.namespace" . }}
+  labels:
+    {{- include "nexusflow.labels" . | nindent 4 }}
+    app.kubernetes.io/name: postgres
+data:
+  init.sql: |
+    -- NexusFlow schema bootstrap
+    CREATE TABLE IF NOT EXISTS tasks (
+        task_id         VARCHAR(64)  PRIMARY KEY,
+        name            VARCHAR(128) NOT NULL,
+        status          VARCHAR(32)  NOT NULL DEFAULT 'pending',
+        payload         JSONB,
+        result          JSONB,
+        retry_count     INTEGER      NOT NULL DEFAULT 0,
+        max_retries     INTEGER      NOT NULL DEFAULT 3,
+        error_message   TEXT,
+        idempotency_key VARCHAR(255),
+        created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+        updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_tasks_status
+        ON tasks (status);
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idempotency_key
+        ON tasks (idempotency_key)
+        WHERE idempotency_key IS NOT NULL;
+
+---
+# ---------------------------------------------------------------------------
+# 2. StatefulSet
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: {{ include "nexusflow.namespace" . }}
+  labels:
+    {{- include "nexusflow.labels" . | nindent 4 }}
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+spec:
+  serviceName: postgres-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        {{- include "nexusflow.labels" . | nindent 8 }}
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/component: database
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.postgres.terminationGracePeriodSeconds }}
+      securityContext:
+        fsGroup: 999   # postgres GID — ensures data volume is writable by uid 999
+      containers:
+        - name: postgres
+          image: "{{ .Values.postgres.image.repository }}:{{ .Values.postgres.image.tag }}"
+          imagePullPolicy: {{ .Values.postgres.image.pullPolicy }}
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "nexusflow.secretName" . }}
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "nexusflow.secretName" . }}
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "nexusflow.configMapName" . }}
+                  key: POSTGRES_DB
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+            - name: init-sql
+              mountPath: /docker-entrypoint-initdb.d/init.sql
+              subPath: init.sql
+              readOnly: true
+          resources:
+            {{- toYaml .Values.postgres.resources | nindent 12 }}
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -h
+                - localhost
+                - -p
+                - "5432"
+                - -U
+                - $(POSTGRES_USER)
+                - -d
+                - $(POSTGRES_DB)
+            initialDelaySeconds: {{ .Values.postgres.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.postgres.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.postgres.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.postgres.probes.liveness.failureThreshold }}
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -h
+                - localhost
+                - -p
+                - "5432"
+                - -U
+                - $(POSTGRES_USER)
+                - -d
+                - $(POSTGRES_DB)
+            initialDelaySeconds: {{ .Values.postgres.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.postgres.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.postgres.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.postgres.probes.readiness.failureThreshold }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false   # postgres writes to /tmp and /run
+      volumes:
+        - name: init-sql
+          configMap:
+            name: postgres-init-sql
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+        labels:
+          {{- include "nexusflow.labels" . | nindent 10 }}
+          app.kubernetes.io/name: postgres
+      spec:
+        accessModes:
+          - {{ .Values.postgres.persistence.accessMode | quote }}
+        {{- if .Values.postgres.persistence.storageClassName }}
+        storageClassName: {{ .Values.postgres.persistence.storageClassName | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.postgres.persistence.size }}
+
+---
+# ---------------------------------------------------------------------------
+# 3a. Headless Service — StatefulSet DNS (postgres-0.postgres-headless)
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-headless
+  namespace: {{ include "nexusflow.namespace" . }}
+  labels:
+    {{- include "nexusflow.labels" . | nindent 4 }}
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+
+---
+# ---------------------------------------------------------------------------
+# 3b. ClusterIP Service — stable DNS endpoint for app pods ("postgres:5432")
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: {{ include "nexusflow.namespace" . }}
+  labels:
+    {{- include "nexusflow.labels" . | nindent 4 }}
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      protocol: TCP

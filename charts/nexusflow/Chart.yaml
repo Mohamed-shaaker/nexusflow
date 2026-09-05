@@ -1,0 +1,15 @@
+apiVersion: v2
+name: nexusflow
+description: >
+  NexusFlow — FastAPI task-queue platform backed by Redis Streams and PostgreSQL.
+  Includes the HTTP gateway, background worker, Postgres, and Redis.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - nexusflow
+  - task-queue
+  - redis-streams
+  - fastapi
+maintainers:
+  - name: NexusFlow Team
